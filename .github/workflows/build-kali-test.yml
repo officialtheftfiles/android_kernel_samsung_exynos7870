@@ -1,0 +1,139 @@
+name: Build Kali test kernel (gtanotexllte)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-19.1
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip xz-utils python3 device-tree-compiler
+
+      - name: Get toolchains (same clang as the ROM, r416183b)
+        run: |
+          git clone --depth 1 -b lineage-20.0 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b $HOME/clang
+          git clone --depth 1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 $HOME/gcc
+          $HOME/clang/bin/clang --version | head -1
+
+      - name: Configure kernel (Kali / native Linux + console)
+        run: |
+          export PATH=$HOME/clang/bin:$HOME/gcc/bin:$PATH
+          export ARCH=arm64
+          make O=out lineage-gtanotexllte_defconfig
+
+          # Native Linux / Kali / systemd essentials
+          ./scripts/config --file out/.config \
+            --enable SYSVIPC \
+            --enable POSIX_MQUEUE \
+            --enable FHANDLE \
+            --enable AUTOFS4_FS \
+            --enable USER_NS \
+            --enable BRIDGE \
+            --enable VETH \
+            --enable DEVTMPFS \
+            --enable DEVTMPFS_MOUNT \
+            --enable TMPFS_POSIX_ACL \
+            --enable TMPFS_XATTR \
+            --enable MAC80211 \
+            --enable MAC80211_MESH \
+            --enable VT \
+            --enable VT_CONSOLE \
+            --enable FRAMEBUFFER_CONSOLE \
+            --enable FONTS \
+            --enable FONT_8x16
+
+          make O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- olddefconfig
+
+      - name: Build kernel Image
+        shell: bash
+        env:
+          KBUILD_BUILD_USER: kali
+          KBUILD_BUILD_HOST: sm-p585
+        run: |
+          set -o pipefail
+          export PATH=$HOME/clang/bin:$HOME/gcc/bin:$PATH
+          export ARCH=arm64
+          make -j$(nproc) O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- Image 2>&1 | tee build.log | tail -n 80
+
+      - name: Build minimal ARM64 BusyBox test initramfs
+        run: |
+          mkdir -p initramfs/{bin,sbin,etc,proc,sys,dev,dev/pts,tmp,mnt,root}
+          cid=$(docker create --platform linux/arm64 busybox:musl)
+          docker cp "$cid:/bin/busybox" initramfs/bin/busybox
+          docker rm "$cid"
+          chmod +x initramfs/bin/busybox
+          file initramfs/bin/busybox
+
+          cat << 'EOF' > initramfs/init
+          #!/bin/busybox sh
+          /bin/busybox --install -s /bin
+
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          mkdir -p /dev/pts
+          mount -t devpts devpts /dev/pts
+
+          # Bring up USB RNDIS networking so phone can connect over OTG (172.16.42.1)
+          if [ -d /sys/class/android_usb/android0 ]; then
+            echo 0 > /sys/class/android_usb/android0/enable 2>/dev/null || true
+            echo 04e8 > /sys/class/android_usb/android0/idVendor 2>/dev/null || true
+            echo 6863 > /sys/class/android_usb/android0/idProduct 2>/dev/null || true
+            echo rndis > /sys/class/android_usb/android0/functions 2>/dev/null || true
+            echo 1 > /sys/class/android_usb/android0/enable 2>/dev/null || true
+          fi
+          sleep 1
+          ip link set lo up 2>/dev/null || true
+          ip link set rndis0 up 2>/dev/null || true
+          ip addr add 172.16.42.1/24 dev rndis0 2>/dev/null || true
+          telnetd -b 0.0.0.0:23 -l /bin/sh 2>/dev/null || true
+
+          # Print status to tablet framebuffer console
+          {
+            echo ""
+            echo "========================================"
+            echo " SM-P585 Custom Linux Kernel Booted!"
+            echo "========================================"
+            uname -a
+            echo "Network interfaces:"
+            ip -brief link 2>/dev/null || ifconfig -a
+            echo "Block devices (eMMC + SD card):"
+            ls -l /dev/mmcblk* 2>/dev/null || true
+            echo "USB RNDIS IP: 172.16.42.1 (telnet port 23)"
+            echo "========================================"
+          } > /dev/tty0 2>/dev/null || true
+
+          while true; do
+            setsid cttyhack /bin/sh < /dev/tty0 > /dev/tty0 2>&1 || /bin/sh
+            sleep 1
+          done
+          EOF
+          chmod +x initramfs/init
+
+          (cd initramfs && find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../out/initramfs-test.cpio.gz)
+
+      - name: Report result
+        run: |
+          ls -lh out/arch/arm64/boot/Image out/initramfs-test.cpio.gz
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+          grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|FHANDLE|AUTOFS4_FS|USER_NS|BRIDGE|VETH|MAC80211|VT|FRAMEBUFFER_CONSOLE|QCA_CLD_WLAN)=' out/.config
+
+      - name: Upload kernel and test initramfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-kali-test-gtanotexllte
+          include-hidden-files: true
+          path: |
+            out/arch/arm64/boot/Image
+            out/initramfs-test.cpio.gz
+            out/.config
+            
